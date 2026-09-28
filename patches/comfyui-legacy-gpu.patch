@@ -1,0 +1,661 @@
+From 28cac35115b663590e910dbc2b04f4250d300646 Mon Sep 17 00:00:00 2001
+From: WYSTAF <wystaf@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 04:29:09 +0330
+Subject: [PATCH 1/4] DirectML: report real VRAM via DXGI instead of hardcoded
+ 1 GiB
+
+torch-directml exposes no usable memory API (gpu_memory() returns zeros on
+most adapters), so get_total_memory() and get_free_memory() both returned a
+hardcoded 1 GiB. On an 8 GB card that under-reports by ~8x, which makes every
+model look too large to keep resident and shows a wrong number in the UI.
+
+Query DXGI for the adapter's true DedicatedVideoMemory and add a conservative
+share of system RAM, which DirectML can also spill into. Falls back to the
+previous 1 GiB if DXGI cannot be queried.
+
+Also fix the device banner printing empty: --directml with no argument leaves
+device_index at -1, which torch_directml.device_name() rejects.
+---
+ comfy/directml_memory.py  | 127 ++++++++++++++++++++++++++++++++++++++
+ comfy/model_management.py |  39 ++++++++++--
+ 2 files changed, 162 insertions(+), 4 deletions(-)
+ create mode 100644 comfy/directml_memory.py
+
+diff --git a/comfy/directml_memory.py b/comfy/directml_memory.py
+new file mode 100644
+index 00000000..8bbf3478
+--- /dev/null
++++ b/comfy/directml_memory.py
+@@ -0,0 +1,127 @@
++"""Dedicated VRAM reporting for the DirectML backend.
++
++torch-directml exposes no usable memory API: ``torch_directml.gpu_memory()``
++returns zeros on most adapters, so ComfyUI historically fell back to a hardcoded
++1 GiB. That under-reports real hardware badly (an RX 580 has 8 GB) and makes the
++VRAM heuristics think every model is too large to keep resident.
++
++This module asks DXGI directly, which reports true dedicated video memory. It is
++only imported when DirectML is actually enabled, so the ctypes/DXGI path never
++costs anything for CUDA/ROCm/CPU users.
++"""
++
++import sys
++
++# DXGI reports a *static* budget. DirectML also draws on system memory through
++# the shared heap, so the free figure is the dedicated amount plus whatever the
++# OS will hand over. A full 50% of system RAM is a conservative, predictable cap
++# rather than a promise to allocate it all.
++_SHARED_VRAM_RATIO = 0.5
++_MIN_REPORTED_VRAM = 1024 * 1024 * 1024
++
++
++def _dxgi_vram():
++    """Return {device_index: dedicated_vram_bytes} for every DXGI adapter."""
++    import ctypes
++    from ctypes import wintypes
++
++    class GUID(ctypes.Structure):
++        _fields_ = [
++            ("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort),
++            ("Data3", ctypes.c_ushort), ("Data4", ctypes.c_ubyte * 8),
++        ]
++
++    class DXGI_ADAPTER_DESC1(ctypes.Structure):
++        _fields_ = [
++            ("Description", wintypes.WCHAR * 128),
++            ("VendorId", wintypes.DWORD), ("DeviceId", wintypes.DWORD),
++            ("SubSysId", wintypes.DWORD), ("Revision", wintypes.DWORD),
++            ("DedicatedVideoMemory", ctypes.c_size_t),
++            ("DedicatedSystemMemory", ctypes.c_size_t),
++            ("SharedSystemMemory", ctypes.c_size_t),
++            ("AdapterLuid", ctypes.c_ulonglong),
++            ("Flags", wintypes.DWORD),
++        ]
++
++    iid_factory1 = GUID(
++        0x770AAE78, 0xF26F, 0x4DBA,
++        (ctypes.c_ubyte * 8)(0xA8, 0x29, 0x25, 0x3C, 0x83, 0xD1, 0xB3, 0x87),
++    )
++
++    dxgi = ctypes.WinDLL("dxgi")
++    factory = ctypes.c_void_p()
++    if dxgi.CreateDXGIFactory1(ctypes.byref(iid_factory1), ctypes.byref(factory)) != 0:
++        return {}
++
++    # IDXGIFactory1 vtable slot 12 is EnumAdapters1; IDXGIAdapter1 slot 10 is
++    # GetDesc1. Indexing the vtable is fragile but is the only way to reach these
++    # without pulling in a full COM binding.
++    vtable = ctypes.cast(factory, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
++    enum_adapters1 = ctypes.WINFUNCTYPE(
++        ctypes.c_long, ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p)
++    )(vtable[12])
++
++    result = {}
++    index = 0
++    while True:
++        adapter = ctypes.c_void_p()
++        if enum_adapters1(factory, index, ctypes.byref(adapter)) != 0:
++            break
++        try:
++            avtable = ctypes.cast(adapter, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
++            get_desc1 = ctypes.WINFUNCTYPE(
++                ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(DXGI_ADAPTER_DESC1)
++            )(avtable[10])
++            desc = DXGI_ADAPTER_DESC1()
++            if get_desc1(adapter, ctypes.byref(desc)) == 0:
++                result[index] = desc.DedicatedVideoMemory
++        except (OSError, ValueError, ctypes.ArgumentError):
++            pass
++        index += 1
++    return result
++
++
++def _dml_device_index(device):
++    """The DirectML adapter index for a torch device, defaulting to 0."""
++    index = getattr(device, "index", None)
++    return 0 if index is None else int(index)
++
++
++def _match_dxgi_by_name(device_index):
++    """DXGI and DirectML index adapters in the same order on every machine we
++    have seen, so index lookup is correct. Kept separate for clarity."""
++    return device_index
++
++
++def get_total_vram(device=None):
++    """Total memory DirectML may use, in bytes, or None if it cannot be determined."""
++    if sys.platform != "win32":
++        return None
++
++    try:
++        per_adapter = _dxgi_vram()
++    except Exception:
++        return None
++
++    if not per_adapter:
++        return None
++
++    index = _match_dxgi_by_name(_dml_device_index(device))
++    dedicated = per_adapter.get(index)
++    if not dedicated:
++        # A hybrid-GPU laptop can order DXGI differently to DirectML. Fall back
++        # to the largest discrete adapter rather than reporting nothing.
++        dedicated = max(per_adapter.values())
++    if not dedicated or dedicated <= 0:
++        return None
++
++    return int(dedicated)
++
++
++def get_shared_budget():
++    """System memory DirectML can borrow over the dedicated VRAM, in bytes."""
++    try:
++        import psutil
++        return int(psutil.virtual_memory().available * _SHARED_VRAM_RATIO)
++    except Exception:
++        return 0
+diff --git a/comfy/model_management.py b/comfy/model_management.py
+index b15d08ba..7955c082 100644
+--- a/comfy/model_management.py
++++ b/comfy/model_management.py
+@@ -107,6 +107,9 @@ if args.deterministic:
+     torch.use_deterministic_algorithms(True, warn_only=True)
+ 
+ directml_enabled = False
++# Used only if DXGI cannot be queried at all; matches the value ComfyUI shipped
++# before, so behaviour is unchanged in that case.
++_DIRECTML_FALLBACK_VRAM = 1024 * 1024 * 1024
+ if args.directml is not None:
+     logging.warning("WARNING: torch-directml barely works, is very slow, has not been updated in over 1 year and might be removed soon, please don't use it, there are better options.")
+     import torch_directml
+@@ -116,11 +119,39 @@ if args.directml is not None:
+         directml_device = torch_directml.device()
+     else:
+         directml_device = torch_directml.device(device_index)
+-    logging.info("Using directml with device: {}".format(torch_directml.device_name(device_index)))
++    logging.info("Using directml with device: {}".format(torch_directml.device_name(directml_device.index)))
+     # torch_directml.disable_tiled_resources(True)
+     lowvram_available = False #TODO: need to find a way to get free memory in directml before this can be enabled by default.
+ 
+ 
++def _directml_total_memory(dev):
++    """Memory DirectML can address, in bytes.
++
++    torch-directml has no memory API worth using, so we ask DXGI for the
++    adapter's dedicated VRAM. DirectML can also spill into system memory, so we
++    report dedicated + a conservative share of RAM: that keeps ComfyUI's
++    offload heuristics honest on 8 GB cards, which the old hardcoded 1 GiB did
++    not (it made every model look too large to keep resident).
++    """
++    from comfy.directml_memory import get_total_vram, get_shared_budget
++
++    dedicated = get_total_vram(dev)
++    if dedicated is None:
++        return _DIRECTML_FALLBACK_VRAM
++    return dedicated + get_shared_budget()
++
++
++def _directml_free_memory(dev):
++    """(free_for_torch, free_beyond_dedicated) in bytes for the DirectML device."""
++    from comfy.directml_memory import get_total_vram, get_shared_budget
++
++    shared = get_shared_budget()
++    dedicated = get_total_vram(dev)
++    if dedicated is None:
++        return _DIRECTML_FALLBACK_VRAM, shared
++    return dedicated, shared
++
++
+ try:
+     _ = torch.xpu.device_count()
+     xpu_available = torch.xpu.is_available()
+@@ -321,7 +352,7 @@ def get_total_memory(dev=None, torch_total_too=False):
+         mem_total_torch = mem_total
+     else:
+         if directml_enabled:
+-            mem_total = 1024 * 1024 * 1024 #TODO
++            mem_total = _directml_total_memory(dev)
+             mem_total_torch = mem_total
+         elif is_intel_xpu():
+             stats = torch.xpu.memory_stats(dev)
+@@ -1660,8 +1691,8 @@ def get_free_memory(dev=None, torch_free_too=False):
+         mem_free_torch = mem_free_total
+     else:
+         if directml_enabled:
+-            mem_free_total = 1024 * 1024 * 1024 #TODO
+-            mem_free_torch = mem_free_total
++            mem_free_torch, mem_free_total = _directml_free_memory(dev)
++            mem_free_total = mem_free_torch + mem_free_total
+         elif is_intel_xpu():
+             stats = torch.xpu.memory_stats(dev)
+             mem_active = stats['active_bytes.all.current']
+-- 
+2.52.0.windows.1
+
+
+From 4d312d9dc22e50b3a1374afbaa0aedd31314cdcb Mon Sep 17 00:00:00 2001
+From: WYSTAF <wystaf@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 04:38:34 +0330
+Subject: [PATCH 2/4] DirectML: report real VRAM via DXGI instead of hardcoded
+ 1 GiB
+
+torch-directml exposes no usable memory API (gpu_memory() returns zeros on
+the adapters tested), so get_total_memory() and get_free_memory() both
+returned a hardcoded 1 GiB. On an 8 GB card that under-reports by ~8x, which
+makes every model look too large to keep resident and shows a wrong number in
+the UI.
+
+Read the adapter's true DedicatedVideoMemory from DXGI. Reports dedicated
+memory only, not the shared-system-memory heap DirectML can also spill into:
+overstating the budget is worse than understating it, because DirectML's
+allocator aborts the process when a large allocation cannot be satisfied, so
+inflating the number turns a graceful fallback into a hard crash. Add
+--directml-vram-gb for setups that know better.
+
+Falls back to the previous 1 GiB if DXGI cannot be queried, so behaviour is
+unchanged on non-Windows and on any query failure.
+
+Also fix the device banner printing empty: --directml with no argument leaves
+device_index at -1, which torch_directml.device_name() rejects.
+---
+ comfy/cli_args.py         |  1 +
+ comfy/directml_memory.py  | 71 ++++++++++++++++++---------------------
+ comfy/model_management.py | 26 +++++++-------
+ 3 files changed, 46 insertions(+), 52 deletions(-)
+
+diff --git a/comfy/cli_args.py b/comfy/cli_args.py
+index 4bef096f..5c02abd9 100644
+--- a/comfy/cli_args.py
++++ b/comfy/cli_args.py
+@@ -88,6 +88,7 @@ parser.add_argument("--fp16-intermediates", action="store_true", help="Experimen
+ parser.add_argument("--force-channels-last", action="store_true", help="Force channels last format when inferencing the models.")
+ 
+ parser.add_argument("--directml", type=int, nargs="?", metavar="DIRECTML_DEVICE", const=-1, help="Use torch-directml.")
++parser.add_argument("--directml-vram-gb", type=float, default=None, metavar="GB", help="Override the VRAM size ComfyUI assumes for DirectML, in GiB. By default this is read from DXGI.")
+ 
+ parser.add_argument("--oneapi-device-selector", type=str, default=None, metavar="SELECTOR_STRING", help="Sets the oneAPI device(s) this instance will use.")
+ parser.add_argument("--supports-fp8-compute", action="store_true", help="ComfyUI will act like if the device supports fp8 compute.")
+diff --git a/comfy/directml_memory.py b/comfy/directml_memory.py
+index 8bbf3478..0da55aa5 100644
+--- a/comfy/directml_memory.py
++++ b/comfy/directml_memory.py
+@@ -1,27 +1,24 @@
+ """Dedicated VRAM reporting for the DirectML backend.
+ 
+ torch-directml exposes no usable memory API: ``torch_directml.gpu_memory()``
+-returns zeros on most adapters, so ComfyUI historically fell back to a hardcoded
+-1 GiB. That under-reports real hardware badly (an RX 580 has 8 GB) and makes the
+-VRAM heuristics think every model is too large to keep resident.
++returns zeros on the adapters we have tested, so ComfyUI historically fell back
++to a hardcoded 1 GiB. That badly under-reports real hardware (an RX 580 has
++8 GB), which makes every model look too large to keep resident and shows a
++wrong number in the UI.
+ 
+ This module asks DXGI directly, which reports true dedicated video memory. It is
+ only imported when DirectML is actually enabled, so the ctypes/DXGI path never
+ costs anything for CUDA/ROCm/CPU users.
+ """
+ 
++import functools
+ import sys
+ 
+-# DXGI reports a *static* budget. DirectML also draws on system memory through
+-# the shared heap, so the free figure is the dedicated amount plus whatever the
+-# OS will hand over. A full 50% of system RAM is a conservative, predictable cap
+-# rather than a promise to allocate it all.
+-_SHARED_VRAM_RATIO = 0.5
+-_MIN_REPORTED_VRAM = 1024 * 1024 * 1024
++from comfy.cli_args import args
+ 
+ 
+ def _dxgi_vram():
+-    """Return {device_index: dedicated_vram_bytes} for every DXGI adapter."""
++    """Return {adapter_index: dedicated_vram_bytes} for every DXGI adapter."""
+     import ctypes
+     from ctypes import wintypes
+ 
+@@ -53,9 +50,9 @@ def _dxgi_vram():
+     if dxgi.CreateDXGIFactory1(ctypes.byref(iid_factory1), ctypes.byref(factory)) != 0:
+         return {}
+ 
+-    # IDXGIFactory1 vtable slot 12 is EnumAdapters1; IDXGIAdapter1 slot 10 is
+-    # GetDesc1. Indexing the vtable is fragile but is the only way to reach these
+-    # without pulling in a full COM binding.
++    # IDXGIFactory1 vtable slot 12 is EnumAdapters1 and IDXGIAdapter1 slot 10 is
++    # GetDesc1. Indexing the vtable is fragile, but it is the only way to reach
++    # these without pulling in a full COM binding for one value.
+     vtable = ctypes.cast(factory, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+     enum_adapters1 = ctypes.WINFUNCTYPE(
+         ctypes.c_long, ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p)
+@@ -81,47 +78,45 @@ def _dxgi_vram():
+     return result
+ 
+ 
+-def _dml_device_index(device):
+-    """The DirectML adapter index for a torch device, defaulting to 0."""
+-    index = getattr(device, "index", None)
+-    return 0 if index is None else int(index)
+-
+-
+-def _match_dxgi_by_name(device_index):
+-    """DXGI and DirectML index adapters in the same order on every machine we
+-    have seen, so index lookup is correct. Kept separate for clarity."""
+-    return device_index
++@functools.lru_cache(maxsize=1)
++def _dxgi_vram_cached():
++    return _dxgi_vram()
+ 
+ 
+ def get_total_vram(device=None):
+-    """Total memory DirectML may use, in bytes, or None if it cannot be determined."""
++    """Dedicated VRAM for a DirectML device, in bytes, or None if undeterminable.
++
++    Deliberately reports dedicated memory only, not the shared-system-memory
++    heap DirectML can also spill into. Overstating the budget is worse than
++    understating it here: DirectML's allocator aborts the process outright when
++    a large allocation cannot be satisfied, so telling ComfyUI it has more room
++    than the card really has turns a graceful fallback into a hard crash. Users
++    who know their setup can raise it with --directml-vram-gb.
++    """
+     if sys.platform != "win32":
+         return None
+ 
++    override = getattr(args, "directml_vram_gb", None)
++    if override is not None and override > 0:
++        return int(override * (1024 ** 3))
++
+     try:
+-        per_adapter = _dxgi_vram()
++        per_adapter = _dxgi_vram_cached()
+     except Exception:
+         return None
+ 
+     if not per_adapter:
+         return None
+ 
+-    index = _match_dxgi_by_name(_dml_device_index(device))
+-    dedicated = per_adapter.get(index)
++    # DirectML and DXGI enumerate adapters in the same order, so the indices
++    # line up. If they ever do not (hybrid-GPU laptops can order them
++    # differently), fall back to the largest discrete adapter rather than
++    # reporting nothing.
++    index = getattr(device, "index", None)
++    dedicated = per_adapter.get(0 if index is None else int(index))
+     if not dedicated:
+-        # A hybrid-GPU laptop can order DXGI differently to DirectML. Fall back
+-        # to the largest discrete adapter rather than reporting nothing.
+         dedicated = max(per_adapter.values())
+     if not dedicated or dedicated <= 0:
+         return None
+ 
+     return int(dedicated)
+-
+-
+-def get_shared_budget():
+-    """System memory DirectML can borrow over the dedicated VRAM, in bytes."""
+-    try:
+-        import psutil
+-        return int(psutil.virtual_memory().available * _SHARED_VRAM_RATIO)
+-    except Exception:
+-        return 0
+diff --git a/comfy/model_management.py b/comfy/model_management.py
+index 7955c082..b857a534 100644
+--- a/comfy/model_management.py
++++ b/comfy/model_management.py
+@@ -125,31 +125,29 @@ if args.directml is not None:
+ 
+ 
+ def _directml_total_memory(dev):
+-    """Memory DirectML can address, in bytes.
++    """Dedicated VRAM for the DirectML device, in bytes.
+ 
+     torch-directml has no memory API worth using, so we ask DXGI for the
+-    adapter's dedicated VRAM. DirectML can also spill into system memory, so we
+-    report dedicated + a conservative share of RAM: that keeps ComfyUI's
+-    offload heuristics honest on 8 GB cards, which the old hardcoded 1 GiB did
+-    not (it made every model look too large to keep resident).
++    adapter's dedicated VRAM. That keeps ComfyUI's offload heuristics honest on
++    8 GB cards, which the old hardcoded 1 GiB did not: it made every model look
++    too large to keep resident and showed a wrong number in the UI.
+     """
+-    from comfy.directml_memory import get_total_vram, get_shared_budget
++    from comfy.directml_memory import get_total_vram
+ 
+     dedicated = get_total_vram(dev)
+     if dedicated is None:
+         return _DIRECTML_FALLBACK_VRAM
+-    return dedicated + get_shared_budget()
++    return dedicated
+ 
+ 
+ def _directml_free_memory(dev):
+-    """(free_for_torch, free_beyond_dedicated) in bytes for the DirectML device."""
+-    from comfy.directml_memory import get_total_vram, get_shared_budget
++    """Free memory for the DirectML device, in bytes.
+ 
+-    shared = get_shared_budget()
+-    dedicated = get_total_vram(dev)
+-    if dedicated is None:
+-        return _DIRECTML_FALLBACK_VRAM, shared
+-    return dedicated, shared
++    DirectML gives no way to query what is currently allocated, so this reports
++    the dedicated VRAM as free. ComfyUI already tracks its own allocations when
++    deciding what to offload, and guessing low here would make it thrash.
++    """
++    return _directml_total_memory(dev), 0
+ 
+ 
+ try:
+-- 
+2.52.0.windows.1
+
+
+From 1a3974f36270a20332eaf00db349b12558947f32 Mon Sep 17 00:00:00 2001
+From: WYSTAF <wystaf@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 09:47:26 +0330
+Subject: [PATCH 3/4] Add --disable-cudnn and fix --disable-mmap for
+ safetensors
+
+--disable-mmap did not actually bypass the memory map: safe_open() maps the
+file and the fault happens on the first get_tensor(), before the flag's
+.to(copy=True) line runs. When the flag is set, load the file whole with
+load_file() instead, which reads rather than maps.
+
+--disable-cudnn is new. Backends that present as CUDA but have no working
+cuDNN -- ZLUDA on gfx803, for instance -- fail convolutions with
+CUDNN_STATUS_INTERNAL_ERROR partway through sampling. ComfyUI's existing AMD
+check does not catch this because such a backend reports a CUDA device, so
+give the user a way to turn cuDNN off explicitly.
+---
+ comfy/cli_args.py         |  1 +
+ comfy/model_management.py |  7 +++++++
+ comfy/utils.py            | 16 ++++++++++++++--
+ 3 files changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/comfy/cli_args.py b/comfy/cli_args.py
+index 5c02abd9..ba6477dc 100644
+--- a/comfy/cli_args.py
++++ b/comfy/cli_args.py
+@@ -75,6 +75,7 @@ fpvae_group.add_argument("--fp32-vae", action="store_true", help="Run the VAE in
+ fpvae_group.add_argument("--bf16-vae", action="store_true", help="Run the VAE in bf16.")
+ 
+ parser.add_argument("--cpu-vae", action="store_true", help="Run the VAE on the CPU.")
++parser.add_argument("--disable-cudnn", action="store_true", help="Disable cuDNN entirely. Needed on backends that present as CUDA but have no working cuDNN, such as ZLUDA on gfx803.")
+ 
+ fpte_group = parser.add_mutually_exclusive_group()
+ fpte_group.add_argument("--fp8_e4m3fn-text-enc", action="store_true", help="Store text encoder weights in fp8 (e4m3fn variant).")
+diff --git a/comfy/model_management.py b/comfy/model_management.py
+index b857a534..2b64a9cf 100644
+--- a/comfy/model_management.py
++++ b/comfy/model_management.py
+@@ -505,6 +505,13 @@ SUPPORT_FP8_OPS = args.supports_fp8_compute
+ AMD_RDNA2_AND_OLDER_ARCH = ["gfx1030", "gfx1031", "gfx1010", "gfx1011", "gfx1012", "gfx906", "gfx900", "gfx803"]
+ AMD_ENABLE_MIOPEN_ENV = 'COMFYUI_ENABLE_MIOPEN'
+ 
++if args.disable_cudnn:
++    # Backends such as ZLUDA report themselves as CUDA and ship cuDNN DLLs, but
++    # have no working cuDNN implementation -- calls fail with
++    # CUDNN_STATUS_INTERNAL_ERROR partway through a sampling run.
++    torch.backends.cudnn.enabled = False
++    logging.info("Set: torch.backends.cudnn.enabled = False from --disable-cudnn.")
++
+ try:
+     if is_amd():
+         arch = torch.cuda.get_device_properties(get_torch_device()).gcnArchName.split(':')[0]
+diff --git a/comfy/utils.py b/comfy/utils.py
+index 61c2a22d..c6abb794 100644
+--- a/comfy/utils.py
++++ b/comfy/utils.py
+@@ -129,13 +129,25 @@ def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
+                 sd, metadata = load_safetensors(ckpt)
+                 if not return_metadata:
+                     metadata = None
++            elif DISABLE_MMAP:
++                # safetensors.safe_open memory-maps the file, and the first
++                # get_tensor() can fault on stacks where the mapping is not
++                # usable (seen under ZLUDA on Windows). load_file() reads the
++                # whole file instead, which is slower but does not map it.
++                # --disable-mmap asked for exactly this, but the flag used to
++                # only copy *after* get_tensor had already faulted.
++                from safetensors.torch import load_file
++                sd = load_file(ckpt, device=device.type)
++                if return_metadata:
++                    with safetensors.safe_open(ckpt, framework="pt", device="cpu") as f:
++                        metadata = f.metadata()
++                else:
++                    metadata = None
+             else:
+                 with safetensors.safe_open(ckpt, framework="pt", device=device.type) as f:
+                     sd = {}
+                     for k in f.keys():
+                         tensor = f.get_tensor(k)
+-                        if DISABLE_MMAP:  # TODO: Not sure if this is the best way to bypass the mmap issues
+-                            tensor = tensor.to(device=device, copy=True)
+                         sd[k] = tensor
+                     if return_metadata:
+                         metadata = f.metadata()
+-- 
+2.52.0.windows.1
+
+
+From e9e7a8b3c715f631193b2dfbbef845f5538837e7 Mon Sep 17 00:00:00 2001
+From: WYSTAF <wystaf@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 07:38:50 +0330
+Subject: [PATCH 4/4] Address review: do not substitute adapters or report
+ total as free
+
+Two safety problems with the DirectML memory reporting in the previous commit:
+
+- get_total_vram() fell back to the largest adapter when the bound adapter was
+  missing or reported no dedicated memory. On a mixed-GPU system that lets
+  ComfyUI size its loads against a card it is not running on, so return None
+  instead and let the caller use the conservative fallback.
+
+- _directml_free_memory() reported the whole dedicated VRAM as free. That
+  invites ComfyUI to plan loads that cannot fit, and DirectML answers an
+  unsatisfiable allocation by aborting the process. Subtract what ComfyUI
+  knows is resident, via LoadedModel.model_loaded_memory(), and clamp at zero.
+
+Also hoist ctypes to module scope in directml_memory.py and import
+get_total_vram at the DirectML init boundary in model_management.py, so
+neither module is loaded for CUDA/ROCm/CPU users. ctypes.wintypes stays
+function-local because it is Windows-only.
+---
+ comfy/directml_memory.py  | 13 +++++++------
+ comfy/model_management.py | 24 +++++++++++++++++-------
+ 2 files changed, 24 insertions(+), 13 deletions(-)
+
+diff --git a/comfy/directml_memory.py b/comfy/directml_memory.py
+index 0da55aa5..4526a2ed 100644
+--- a/comfy/directml_memory.py
++++ b/comfy/directml_memory.py
+@@ -11,6 +11,7 @@ only imported when DirectML is actually enabled, so the ctypes/DXGI path never
+ costs anything for CUDA/ROCm/CPU users.
+ """
+ 
++import ctypes
+ import functools
+ import sys
+ 
+@@ -19,7 +20,9 @@ from comfy.cli_args import args
+ 
+ def _dxgi_vram():
+     """Return {adapter_index: dedicated_vram_bytes} for every DXGI adapter."""
+-    import ctypes
++    # ctypes.wintypes exists only on Windows, so it is imported here rather than
++    # at module scope. This module is itself only imported when DirectML is
++    # enabled, which is Windows-only anyway.
+     from ctypes import wintypes
+ 
+     class GUID(ctypes.Structure):
+@@ -109,13 +112,11 @@ def get_total_vram(device=None):
+         return None
+ 
+     # DirectML and DXGI enumerate adapters in the same order, so the indices
+-    # line up. If they ever do not (hybrid-GPU laptops can order them
+-    # differently), fall back to the largest discrete adapter rather than
+-    # reporting nothing.
++    # line up. Do not substitute another adapter's capacity when the bound one
++    # is missing or reports nothing: on a mixed-GPU system that would let
++    # ComfyUI size its loads against a card it is not running on.
+     index = getattr(device, "index", None)
+     dedicated = per_adapter.get(0 if index is None else int(index))
+-    if not dedicated:
+-        dedicated = max(per_adapter.values())
+     if not dedicated or dedicated <= 0:
+         return None
+ 
+diff --git a/comfy/model_management.py b/comfy/model_management.py
+index 2b64a9cf..1cd04d54 100644
+--- a/comfy/model_management.py
++++ b/comfy/model_management.py
+@@ -122,6 +122,8 @@ if args.directml is not None:
+     logging.info("Using directml with device: {}".format(torch_directml.device_name(directml_device.index)))
+     # torch_directml.disable_tiled_resources(True)
+     lowvram_available = False #TODO: need to find a way to get free memory in directml before this can be enabled by default.
++    # Imported here so the DXGI path is not loaded for CUDA/ROCm/CPU users.
++    from comfy.directml_memory import get_total_vram
+ 
+ 
+ def _directml_total_memory(dev):
+@@ -132,8 +134,6 @@ def _directml_total_memory(dev):
+     8 GB cards, which the old hardcoded 1 GiB did not: it made every model look
+     too large to keep resident and showed a wrong number in the UI.
+     """
+-    from comfy.directml_memory import get_total_vram
+-
+     dedicated = get_total_vram(dev)
+     if dedicated is None:
+         return _DIRECTML_FALLBACK_VRAM
+@@ -141,13 +141,23 @@ def _directml_total_memory(dev):
+ 
+ 
+ def _directml_free_memory(dev):
+-    """Free memory for the DirectML device, in bytes.
++    """(free, shared) memory for the DirectML device, in bytes.
+ 
+-    DirectML gives no way to query what is currently allocated, so this reports
+-    the dedicated VRAM as free. ComfyUI already tracks its own allocations when
+-    deciding what to offload, and guessing low here would make it thrash.
++    DirectML exposes no way to query what is currently allocated on the device,
++    so subtract what ComfyUI knows it has loaded. Reporting the full dedicated
++    VRAM as free -- as the previous constant did -- would let ComfyUI plan loads
++    that cannot fit, and DirectML answers an unsatisfiable allocation by
++    aborting the process.
+     """
+-    return _directml_total_memory(dev), 0
++    total = _directml_total_memory(dev)
++    loaded = 0
++    for loaded_model in current_loaded_models:
++        try:
++            loaded += loaded_model.model_loaded_memory()
++        except Exception:
++            # A model whose weakref has been collected, or one mid-unload.
++            continue
++    return max(total - loaded, 0), 0
+ 
+ 
+ try:
+-- 
+2.52.0.windows.1
+

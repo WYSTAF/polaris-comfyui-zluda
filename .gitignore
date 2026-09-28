@@ -1,0 +1,12 @@
+# Setup output — all of this is fetched or built by setup.py
+dl/
+zluda/
+hip/
+venv/
+ComfyUI/
+rocblas_fix/
+backup_rocblas.dll/
+backup_torch_dlls/
+hip_extract.log
+run_zluda.bat
+__pycache__/
