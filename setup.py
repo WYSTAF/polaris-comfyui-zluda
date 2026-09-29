@@ -9,6 +9,7 @@ Usage:  python setup.py [--yes]
 """
 
 import argparse
+import importlib.util
 import os
 import re
 import shutil
@@ -71,6 +72,14 @@ def run(cmd, **kw):
     return r
 
 
+def _has_venv():
+    return importlib.util.find_spec("venv") is not None
+
+
+def _has_pip():
+    return importlib.util.find_spec("pip") is not None
+
+
 def check_prereqs():
     step("Checking prerequisites")
     if sys.platform != "win32":
@@ -80,6 +89,11 @@ def check_prereqs():
             f"Need Python 3.12 exactly; this is {sys.version_info.major}.{sys.version_info.minor}. "
             "The cu118 torch wheels are built for cp312.")
     info(f"python {sys.version.split()[0]} on {sys.platform} - ok")
+    if "venv" not in sys.modules and not _has_venv():
+        warn("This Python has no venv module (ComfyUI's bundled python_embeded does not).")
+        warn("setup.py will fall back to virtualenv, which needs a working pip.")
+    if "pip" not in sys.modules and not _has_pip():
+        warn("This Python has no pip. Install Python 3.12 from python.org instead.")
     free = shutil.disk_usage(".").free / 1024**3
     info(f"{free:.1f} GB free here")
     if free < 12:
@@ -97,7 +111,7 @@ def check_prereqs():
     return admin
 
 
-def download(url, dest, label, attempts=8):
+def download(url, dest, label, attempts=200):
     """Fetch a file, resuming and verifying it is complete.
 
     This network drops long transfers part-way without raising, and a truncated
@@ -110,6 +124,8 @@ def download(url, dest, label, attempts=8):
     dest = Path(dest)
     total = 0
     known_size = {}
+    last_have = 0
+    stalled = 0
 
     for attempt in range(1, attempts + 1):
         have = dest.stat().st_size if dest.exists() else 0
@@ -170,16 +186,31 @@ def download(url, dest, label, attempts=8):
             info(f"{label}: done ({have / 1024**2:.1f} MB)")
             return dest
         except Exception as e:
-            warn(f"{label}: {e}")
-            # Keep whatever arrived -- the next attempt resumes from it.
-            if attempt == attempts:
-                got = dest.stat().st_size if dest.exists() else 0
+            got = dest.stat().st_size if dest.exists() else 0
+            progressed = got > last_have
+            if not progressed:
+                stalled += 1
+            else:
+                stalled = 0
+                if total:
+                    info(f"{label}: {got * 100 // total}% ({got / 1048576:.0f} MB) "
+                         "- connection dropped, resuming")
+            last_have = got
+
+            # Several attempts in a row making no progress means the link is
+            # not usable for a file this size, rather than merely slow.
+            if stalled >= 4:
                 raise SystemExit(
-                    f"Could not download {label} after {attempts} attempts: {e}\n"
+                    f"Download of {label} is stuck at {got / 1048576:.0f} MB: {e}\n"
                     f"  {url}\n"
-                    f"  Re-run setup.py to continue from {got / 1024**2:.0f} MB, or\n"
-                    f"  download the file manually into the dl/ folder.")
-            time.sleep(2)
+                    "  This connection is dropping the transfer every time and never\n"
+                    "  getting further. Torch is 2.6 GB, which needs a steady link.\n"
+                    "  Options:\n"
+                    f"    - download it in a browser and save it as dl/{dest.name}\n"
+                    "    - run setup.py again later on a better connection\n"
+                    "    - on a metered or slow link, fetch it over several sittings;\n"
+                    "      each run continues from where the last stopped")
+            time.sleep(3)
 
 
 def check_archive(path, kind):
@@ -300,7 +331,19 @@ def setup_venv():
     if vpy.exists():
         info("venv already exists")
     else:
-        run([PY, "-m", "venv", str(VENV)])
+        # ComfyUI's bundled python_embeded has no venv module, and neither do
+        # some minimal installs. Fall back to virtualenv, which does not need it.
+        r = subprocess.run([PY, "-m", "venv", str(VENV)], capture_output=True, text=True)
+        if r.returncode != 0 or not vpy.exists():
+            info("this Python has no venv module, trying virtualenv")
+            rv = subprocess.run([PY, "-m", "pip", "install", "virtualenv"],
+                               capture_output=True, text=True)
+            run([PY, "-m", "virtualenv", str(VENV)])
+        if not vpy.exists():
+            raise SystemExit(
+                "Could not create a virtual environment with this Python.\n"
+                "  Install Python 3.12 from python.org (the 'Windows installer'), which\n"
+                "  includes venv, then re-run setup.py with that python.")
     info(f"venv python: {vpy}")
 
     w = download(TORCH_URL, DL / "torch-2.2.1+cu118-cp312-cp312-win_amd64.whl", "torch")
