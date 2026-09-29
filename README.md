@@ -27,10 +27,11 @@ You need:
 | | |
 |---|---|
 | OS | Windows 10 22H2 (build 19045) or Windows 11 |
-| Python | **3.12, exactly** — the prebuilt wheels do not exist for 3.13 |
+| Python | **3.12, exactly** — the prebuilt wheels do not exist for 3.13. A Python without `venv` (such as ComfyUI's bundled `python_embeded`) is detected and worked around, but a normal install from python.org is easier |
 | Disk | 12 GB free |
 | RAM | 16 GB recommended; 8 GB will struggle |
 | Admin rights | Needed once, for the HIP SDK install |
+| Connection | ~4 GB downloads in total. On a slow or metered link this takes a while |
 
 Four things that will otherwise cost you an evening:
 
@@ -44,11 +45,12 @@ Four things that will otherwise cost you an evening:
    libraries it needs, so nothing is installed system-wide beyond that.
 4. **A single `TdrDelay` tweak can help** if you hit GPU timeouts — it needs
    admin, so the script does not do it for you.
-5. **Downloads may stall on a poor connection.** The HIP SDK is 1.2 GB and some
-   networks cut a transfer off after a few hundred MB. The script resumes
-   partial downloads and verifies the result, so simply re-running it makes
-   progress. If a file is ever reported corrupt, delete it from `dl/` and run
-   again.
+5. **Downloads may stall on a poor connection.** The script needs about 4 GB in
+   total, and the torch wheel alone is 2.6 GB. A link running below about
+   1 MB/s will drop before that finishes. The script resumes where it stopped
+   and verifies the result, so **re-running it always makes progress** — it can
+   take several runs on a slow connection. If a file is ever reported corrupt,
+   delete it from `dl/` and run again.
 
 ## Install
 
@@ -128,6 +130,11 @@ is gone from GitHub. If setup fails, check in this order:
    `--disable-cudnn`; check you are running the generated `.bat`.
 5. **Model runs and then dies** — you are over the VRAM ceiling. Use a smaller
    model.
+6. **`No module named venv`** — you used ComfyUI's bundled Python. The script
+   falls back to virtualenv automatically; if that also fails, install Python
+   3.12 from python.org and re-run with it.
+7. **Stuck downloading torch** — expected on a slow link. Just run `setup.py`
+   again; it continues from the bytes it already has.
 
 ## Licence and attribution
 
