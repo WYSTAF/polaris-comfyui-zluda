@@ -346,14 +346,28 @@ def setup_venv():
                 "  includes venv, then re-run setup.py with that python.")
     info(f"venv python: {vpy}")
 
-    w = download(TORCH_URL, DL / "torch-2.2.1+cu118-cp312-cp312-win_amd64.whl", "torch")
-    if not check_archive(w, "zip"):
-        raise SystemExit("The torch wheel is corrupt. Delete it from dl/ and re-run.")
-    run([str(vpy), "-m", "pip", "install", "--no-cache-dir", "--no-deps", str(w)])
-    tv = download(TORCHVISION_URL, DL / "torchvision-0.17.1+cu118-cp312-cp312-win_amd64.whl", "torchvision")
-    if not check_archive(tv, "zip"):
-        raise SystemExit("The torchvision wheel is corrupt. Delete it from dl/ and re-run.")
-    run([str(vpy), "-m", "pip", "install", "--no-cache-dir", "--no-deps", str(tv)])
+    def have_pkg(name):
+        r = subprocess.run([str(vpy), "-c",
+                            f"import importlib.metadata as m; print(m.version('{name}'))"],
+                           capture_output=True, text=True)
+        return r.returncode == 0
+
+    # torch is a 2.6 GB download, so do not fetch it when it is already there.
+    if have_pkg("torch"):
+        info("torch is already installed in this venv, skipping the 2.6 GB download")
+    else:
+        w = download(TORCH_URL, DL / "torch-2.2.1+cu118-cp312-cp312-win_amd64.whl", "torch")
+        if not check_archive(w, "zip"):
+            raise SystemExit("The torch wheel is corrupt. Delete it from dl/ and re-run.")
+        run([str(vpy), "-m", "pip", "install", "--no-cache-dir", "--no-deps", str(w)])
+
+    if have_pkg("torchvision"):
+        info("torchvision is already installed, skipping")
+    else:
+        tv = download(TORCHVISION_URL, DL / "torchvision-0.17.1+cu118-cp312-cp312-win_amd64.whl", "torchvision")
+        if not check_archive(tv, "zip"):
+            raise SystemExit("The torchvision wheel is corrupt. Delete it from dl/ and re-run.")
+        run([str(vpy), "-m", "pip", "install", "--no-cache-dir", "--no-deps", str(tv)])
 
     for name, ver in PINS.items():
         for attempt in range(4):
