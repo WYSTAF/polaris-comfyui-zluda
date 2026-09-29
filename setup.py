@@ -97,54 +97,89 @@ def check_prereqs():
     return admin
 
 
-def download(url, dest, label, attempts=5):
-    """Fetch a file, verifying it is complete.
+def download(url, dest, label, attempts=8):
+    """Fetch a file, resuming and verifying it is complete.
 
-    This network drops long transfers part-way without raising, and a
-    truncated zip or 7z still opens as a valid-looking file, so the size is
-    always checked against Content-Length and a short read is retried.
+    This network drops long transfers part-way without raising, and a truncated
+    zip or 7z still has a valid magic number, so the failure otherwise shows up
+    much later as "File is not a zip file". Two defences: every response is
+    checked against Content-Length, and a partial file is continued with a
+    Range request rather than thrown away -- the HIP SDK is 1.2 GB and a network
+    that cuts off around a few hundred MB would otherwise never finish it.
     """
     dest = Path(dest)
+    total = 0
+    known_size = {}
+
     for attempt in range(1, attempts + 1):
-        if dest.exists() and dest.stat().st_size > 0:
-            info(f"{label}: already downloaded ({dest.stat().st_size / 1024**2:.0f} MB)")
+        have = dest.stat().st_size if dest.exists() else 0
+        if have and label in known_size and have >= known_size[label]:
+            info(f"{label}: already complete ({have / 1024**2:.1f} MB)")
             return dest
 
-        info(f"{label}: downloading -> {dest.name}"
-             + (f" (attempt {attempt})" if attempt > 1 else ""))
+        headers = {"User-Agent": "Mozilla/5.0"}
+        if have:
+            headers["Range"] = f"bytes={have}-"
+            info(f"{label}: resuming at {have / 1024**2:.0f} MB"
+                 + (f" of {known_size[label] / 1024**2:.0f} MB" if label in known_size else ""))
+        else:
+            info(f"{label}: downloading -> {dest.name}")
+
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=120) as r:
-                expected = int(r.headers["Content-Length"]) if r.headers.get("Content-Length") else 0
-                got = 0
-                with open(dest, "wb") as f:
+            req = urllib.request.Request(url, headers=headers)
+            try:
+                r = urllib.request.urlopen(req, timeout=120)
+            except urllib.error.HTTPError as e:
+                # 416 means the bytes we already have reach past the end of the
+                # file, i.e. it is already complete. Re-fetching the size
+                # header is enough to confirm.
+                if e.code == 416 and have:
+                    with urllib.request.urlopen(
+                            urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}),
+                            timeout=120) as chk:
+                        full = int(chk.headers.get("Content-Length", 0))
+                    if full and have >= full:
+                        info(f"{label}: already complete ({have / 1024**2:.1f} MB)")
+                        return dest
+                raise
+            with r:
+                if r.status == 206:          # partial content
+                    mode = "ab"
+                    total = have + int(r.headers.get("Content-Length", 0))
+                else:                        # server ignored the Range
+                    mode = "wb"
+                    have = 0
+                    total = int(r.headers.get("Content-Length", 0))
+                if total:
+                    known_size[label] = total
+                with open(dest, mode) as f:
                     while True:
                         chunk = r.read(1 << 20)
                         if not chunk:
                             break
                         f.write(chunk)
-                        got += len(chunk)
-                        if expected:
-                            print(f"\r    {got * 100 // expected}% "
-                                  f"({got / 1024**2:.0f}/{expected / 1024**2:.0f} MB)",
+                        have += len(chunk)
+                        if total:
+                            print(f"\r    {have * 100 // total}% "
+                                  f"({have / 1024**2:.0f}/{total / 1024**2:.0f} MB)",
                                   end="", flush=True)
-            if expected:
+            if total:
                 print()
-            if expected and got < expected:
-                raise IOError(f"short read: {got} of {expected} bytes")
-            info(f"{label}: done ({got / 1024**2:.1f} MB)")
+            if total and have < total:
+                raise IOError(f"short read: {have} of {total} bytes")
+            info(f"{label}: done ({have / 1024**2:.1f} MB)")
             return dest
         except Exception as e:
             warn(f"{label}: {e}")
-            if dest.exists():
-                dest.unlink()
+            # Keep whatever arrived -- the next attempt resumes from it.
             if attempt == attempts:
+                got = dest.stat().st_size if dest.exists() else 0
                 raise SystemExit(
                     f"Could not download {label} after {attempts} attempts: {e}\n"
                     f"  {url}\n"
-                    "  This looks like a network problem. Try again, or download the\n"
-                    "  file manually into the dl/ folder and re-run.")
-            time.sleep(3)
+                    f"  Re-run setup.py to continue from {got / 1024**2:.0f} MB, or\n"
+                    f"  download the file manually into the dl/ folder.")
+            time.sleep(2)
 
 
 def check_archive(path, kind):
