@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -51,11 +52,11 @@ PINS = {
     "comfyui-embedded-docs": "0.5.6",
 }
 
-DL = "dl"
-ZL = "zluda"
-HIP = "hip"
-VENV = "venv"
-REPO_DIR = "ComfyUI"
+DL = Path("dl")
+ZL = Path("zluda")
+HIP = Path("hip")
+VENV = Path("venv")
+REPO_DIR = Path("ComfyUI")
 
 step = lambda m: print(f"\n=== {m}", flush=True)
 info = lambda m: print(f"    {m}", flush=True)
@@ -96,35 +97,90 @@ def check_prereqs():
     return admin
 
 
-def download(url, dest, label):
+def download(url, dest, label, attempts=5):
+    """Fetch a file, verifying it is complete.
+
+    This network drops long transfers part-way without raising, and a
+    truncated zip or 7z still opens as a valid-looking file, so the size is
+    always checked against Content-Length and a short read is retried.
+    """
     dest = Path(dest)
-    if dest.exists() and dest.stat().st_size > 0:
-        info(f"{label}: already downloaded ({dest.stat().st_size / 1024**2:.0f} MB)")
-        return dest
-    info(f"{label}: downloading -> {dest.name}")
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    total = 0
-    with urllib.request.urlopen(req, timeout=60) as r, open(dest, "wb") as f:
-        if r.headers.get("Content-Length"):
-            total = int(r.headers["Content-Length"])
-        while True:
-            chunk = r.read(1 << 20)
-            if not chunk:
-                break
-            f.write(chunk)
-            if total:
-                pct = f.tell() * 100 // total
-                print(f"\r    {pct}% ({f.tell() / 1024**2:.0f}/{total / 1024**2:.0f} MB)",
-                      end="", flush=True)
-    if total:
-        print()
-    info(f"{label}: done ({dest.stat().st_size / 1024**2:.0f} MB)")
-    return dest
+    for attempt in range(1, attempts + 1):
+        if dest.exists() and dest.stat().st_size > 0:
+            info(f"{label}: already downloaded ({dest.stat().st_size / 1024**2:.0f} MB)")
+            return dest
+
+        info(f"{label}: downloading -> {dest.name}"
+             + (f" (attempt {attempt})" if attempt > 1 else ""))
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=120) as r:
+                expected = int(r.headers["Content-Length"]) if r.headers.get("Content-Length") else 0
+                got = 0
+                with open(dest, "wb") as f:
+                    while True:
+                        chunk = r.read(1 << 20)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        got += len(chunk)
+                        if expected:
+                            print(f"\r    {got * 100 // expected}% "
+                                  f"({got / 1024**2:.0f}/{expected / 1024**2:.0f} MB)",
+                                  end="", flush=True)
+            if expected:
+                print()
+            if expected and got < expected:
+                raise IOError(f"short read: {got} of {expected} bytes")
+            info(f"{label}: done ({got / 1024**2:.1f} MB)")
+            return dest
+        except Exception as e:
+            warn(f"{label}: {e}")
+            if dest.exists():
+                dest.unlink()
+            if attempt == attempts:
+                raise SystemExit(
+                    f"Could not download {label} after {attempts} attempts: {e}\n"
+                    f"  {url}\n"
+                    "  This looks like a network problem. Try again, or download the\n"
+                    "  file manually into the dl/ folder and re-run.")
+            time.sleep(3)
+
+
+def check_archive(path, kind):
+    """Return True if `path` is a structurally valid archive of `kind`.
+
+    A truncated download still has a valid magic number, so opening it is not
+    proof. This is called before trusting a file that download() had cached.
+    """
+    p = Path(path)
+    if not p.exists():
+        return False
+    try:
+        if kind == "zip":
+            with zipfile.ZipFile(p) as z:
+                bad = z.testzip() if z.namelist() else "empty"
+        else:  # 7z
+            import py7zr
+            with py7zr.SevenZipFile(p, "r") as z:
+                bad = None if z.getnames() else "empty"
+    except Exception as e:
+        warn(f"{p.name} is not a usable {kind}: {e}")
+        return False
+    if bad:
+        warn(f"{p.name} is corrupt ({bad})")
+        return False
+    return True
 
 
 def setup_zluda():
     step("Installing ZLUDA (the CUDA-to-AMD translator)")
-    z = download(ZLUDA_URL, DL / "zluda.zip", "zluda")
+    zp = DL / "zluda.zip"
+    if zp.exists() and not check_archive(zp, "zip"):
+        zp.unlink()  # truncated from an earlier run; fetch it again
+    z = download(ZLUDA_URL, zp, "zluda")
+    if not check_archive(z, "zip"):
+        raise SystemExit("The ZLUDA archive is corrupt. Delete dl/zluda.zip and re-run.")
     out = Path(ZL)
     if not (out / "zluda" / "zluda.exe").exists():
         out.mkdir(exist_ok=True)
@@ -182,6 +238,8 @@ def setup_rocblas(lib):
     except ImportError:
         run([PY, "-m", "pip", "install", "py7zr"])
         import py7zr
+    if not check_archive(z, "7z"):
+        raise SystemExit("The rocBLAS archive is corrupt. Delete dl/rocblas.7z and re-run.")
     with py7zr.SevenZipFile(z, "r") as f:
         f.extractall("rocblas_fix")
     src = Path("rocblas_fix")
@@ -211,8 +269,12 @@ def setup_venv():
     info(f"venv python: {vpy}")
 
     w = download(TORCH_URL, DL / "torch-2.2.1+cu118-cp312-cp312-win_amd64.whl", "torch")
+    if not check_archive(w, "zip"):
+        raise SystemExit("The torch wheel is corrupt. Delete it from dl/ and re-run.")
     run([str(vpy), "-m", "pip", "install", "--no-cache-dir", "--no-deps", str(w)])
     tv = download(TORCHVISION_URL, DL / "torchvision-0.17.1+cu118-cp312-cp312-win_amd64.whl", "torchvision")
+    if not check_archive(tv, "zip"):
+        raise SystemExit("The torchvision wheel is corrupt. Delete it from dl/ and re-run.")
     run([str(vpy), "-m", "pip", "install", "--no-cache-dir", "--no-deps", str(tv)])
 
     for name, ver in PINS.items():
@@ -278,11 +340,11 @@ def setup_comfyui():
     if (Path(REPO_DIR) / "main.py").exists():
         info("already present")
         return
-    run(["git", "clone", "--depth", "1", "--branch", COMFYUI_REF, COMFYUI_REPO, REPO_DIR])
+    run(["git", "clone", "--depth", "1", "--branch", COMFYUI_REF, COMFYUI_REPO, str(REPO_DIR)])
     patch = Path(__file__).parent / "patches" / "comfyui-legacy-gpu.patch"
     if patch.exists():
         info("applying legacy-GPU fixes")
-        r = subprocess.run(["git", "-C", REPO_DIR, "apply", str(patch)], capture_output=True, text=True)
+        r = subprocess.run(["git", "-C", str(REPO_DIR), "apply", str(patch)], capture_output=True, text=True)
         if r.returncode == 0:
             info("patch applied")
         elif "already applied" in (r.stdout + r.stderr):
@@ -317,7 +379,7 @@ def write_launcher(hlib):
         f'set "HIP_PATH={hlib.parent}"\n'
         'set "PATH=%HIP_PATH%\\bin;%PATH%"\n\n'
         f'"{here / ZL / "zluda" / "zluda.exe"}" -- "{here / VENV / "Scripts" / "python.exe"}" '
-        f'-s "{REPO_DIR}\\main.py" --use-quad-cross-attention --reserve-vram 0.9 '
+        f'-s "{here / REPO_DIR / "main.py"}" --use-quad-cross-attention --reserve-vram 0.9 '
         '--disable-async-offload --disable-pinned-memory --disable-cuda-malloc '
         '--disable-mmap --disable-cudnn --cpu-vae --lowvram %*\n'
         "pause\n", encoding="utf-8")
