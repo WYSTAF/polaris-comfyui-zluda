@@ -44,6 +44,11 @@ Four things that will otherwise cost you an evening:
    libraries it needs, so nothing is installed system-wide beyond that.
 4. **A single `TdrDelay` tweak can help** if you hit GPU timeouts — it needs
    admin, so the script does not do it for you.
+5. **Downloads may stall on a poor connection.** The HIP SDK is 1.2 GB and some
+   networks cut a transfer off after a few hundred MB. The script resumes
+   partial downloads and verifies the result, so simply re-running it makes
+   progress. If a file is ever reported corrupt, delete it from `dl/` and run
+   again.
 
 ## Install
 
