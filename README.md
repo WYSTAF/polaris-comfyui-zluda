@@ -70,15 +70,24 @@ When it finishes, double-click **`run_zluda.bat`**, then open
 
 ## Which models will work
 
-**SD 1.5 is the practical ceiling.** A single allocation above roughly 1.75 GB
-segfaults the process, and that limit comes from the AMD driver, not from
-ComfyUI or ZLUDA. Nothing in this repository can raise it.
+**SD 1.5 is the practical ceiling.** Two limits combine:
+
+- **~2 GB per single allocation.** Anything larger than that in one tensor
+  segfaults the process. Measured on an RX 580: 2.0 GB works, 2.5 GB dies.
+- **~6 GB usable in total** out of the 8 GB the card reports. In practice
+  5-6 GB of allocations across many tensors works fine.
+
+Neither is raised by anything in this repository. But note that the limit is on
+the size of *one* allocation, not the total: a model held as many smaller
+tensors is not affected, and GGUF models stay quantised and dequantise per-op
+rather than into one contiguous tensor.
 
 | Model | Result |
 |---|---|
-| SD 1.5 (fp16, ~2 GB) | ✅ Works |
+| SD 1.5 (fp16, ~2 GB) | ✅ Works — 33-100 s at 512x512 |
 | SD 1.5 inpainting, ControlNet | ✅ Works |
-| SDXL, Flux, Qwen-Image, anything ≥ 3 GB | ❌ Exceeds the ceiling |
+| Qwen-Image 2.1 Turbo (GGUF Q5) | ⚠️ UNet loads and computes fine, but needs a 5.7 GB text encoder; not verified |
+| SDXL, Flux, anything ≥ 3 GB in one tensor | ❌ Exceeds the per-allocation ceiling |
 
 A good first download:
 <https://huggingface.co/Comfy-Org/stable-diffusion-v1-5-archive> →
@@ -111,11 +120,13 @@ ComfyUI is pinned to **v0.27.0** for the same reason: v0.37+ needs torch ≥ 2.7
 
 ## What is not supported
 
-- `bfloat16` — the RX 580 has no hardware support and the emulated path crashes
-- bf16 models, including Qwen-Image and SD3
-- SageAttention, Triton, xformers, bitsandbytes, cuDNN, `torch.compile`
+- `bfloat16` — the RX 580 has no hardware support, but under **ZLUDA it works**:
+  `torch.cuda.is_bf16_supported()` returns True and bf16 matmul, attention,
+  layer_norm and gelu all pass. It hard-crashes under DirectML instead, so this
+  is a ZLUDA-specific capability, not a Polaris one.
+- SageAttention, Triton, xformers, bitsandbytes, `torch.compile`
 - Multiple GPUs
-- Anything above the ~1.75 GB allocation ceiling
+- A single allocation above ~2 GB (many smaller ones are fine)
 
 ## When it breaks
 
