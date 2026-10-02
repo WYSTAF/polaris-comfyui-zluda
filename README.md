@@ -86,7 +86,7 @@ rather than into one contiguous tensor.
 |---|---|
 | SD 1.5 (fp16, ~2 GB) | ✅ Works — 33-100 s at 512x512 |
 | SD 1.5 inpainting, ControlNet | ✅ Works |
-| Qwen-Image 2.1 Turbo (GGUF Q5) | ⚠️ UNet loads and computes fine, but needs a 5.7 GB text encoder; not verified |
+| Qwen-Image 2.1 Turbo (GGUF Q5) | ❌ UNet loads and computes, but its VAE is 3D and Conv3d is unimplemented under ZLUDA |
 | SDXL, Flux, anything ≥ 3 GB in one tensor | ❌ Exceeds the per-allocation ceiling |
 
 A good first download:
@@ -120,6 +120,11 @@ ComfyUI is pinned to **v0.27.0** for the same reason: v0.37+ needs torch ≥ 2.7
 
 ## What is not supported
 
+- **3D convolutions.** `aten::empty_strided` is not implemented for the
+  PrivateUse1 backend, so `torch.nn.Conv3d` fails outright. That rules out every
+  model whose VAE is 3D — Qwen-Image, CogVideoX and similar — even though their
+  UNet alone loads and computes. It is a ZLUDA kernel gap and cannot be fixed
+  from here; it would need implementing in ZLUDA itself.
 - `bfloat16` — the RX 580 has no hardware support, but under **ZLUDA it works**:
   `torch.cuda.is_bf16_supported()` returns True and bf16 matmul, attention,
   layer_norm and gelu all pass. It hard-crashes under DirectML instead, so this
