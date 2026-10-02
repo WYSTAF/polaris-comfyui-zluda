@@ -84,10 +84,41 @@ rather than into one contiguous tensor.
 
 | Model | Result |
 |---|---|
-| SD 1.5 (fp16, ~2 GB) | ✅ Works — 33-100 s at 512x512 |
-| SD 1.5 inpainting, ControlNet | ✅ Works |
+| SD 1.5 (fp16, ~2 GB) | ✅ Works |
+| SD 1.5 inpainting, ControlNet | ✅ Expected to work (not measured) |
 | Qwen-Image 2.1 Turbo (GGUF Q5) | ❌ UNet loads and computes, but its VAE is 3D and Conv3d is unimplemented under ZLUDA |
-| SDXL, Flux, anything ≥ 3 GB in one tensor | ❌ Exceeds the per-allocation ceiling |
+| SDXL, Flux, anything ≥ 3 GB in one tensor | ❌ Not tested — likely beyond the per-allocation ceiling |
+
+### Measured on an RX 580 8GB (SD 1.5, ZLUDA)
+
+Times include model load. Roughly **2 s per step** at 512×512, plus a fixed
+~10 s overhead.
+
+| Resolution | 20 steps |
+|---|---|
+| 256×256 | 20 s |
+| 384×384 | 30 s |
+| 512×512 | 50 s |
+| 640×640 | 75 s |
+| 768×768 | 115 s |
+
+| Steps (512×512) | Time |
+|---|---|
+| 10 | 35 s |
+| 20 | 45–50 s |
+| 30 | 55 s |
+| 50 | 120 s |
+
+| Batch (512×512, 10 steps) | Time |
+|---|---|
+| 1 | 35 s |
+| 2 | 60 s |
+| 4 | 120 s |
+
+Samplers: `euler`, `euler_ancestral`, `dpmpp_2m`, `ddim` all work — `ddim` is
+much the slowest at ~360 s. `dpmpp_sde` did not finish. `unipc` is rejected as
+not supported in this ComfyUI version. All six schedulers work; `simple` and
+`beta` are the fastest.
 
 A good first download:
 <https://huggingface.co/Comfy-Org/stable-diffusion-v1-5-archive> →
