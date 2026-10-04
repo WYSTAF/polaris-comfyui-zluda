@@ -86,8 +86,8 @@ rather than into one contiguous tensor.
 |---|---|
 | SD 1.5 (fp16, ~2 GB) | ✅ Works |
 | SD 1.5 inpainting, ControlNet | ✅ Expected to work (not measured) |
-| Qwen-Image 2.1 Turbo (GGUF Q5) | ❌ UNet loads and computes, but its VAE is 3D and Conv3d is unimplemented under ZLUDA |
-| SDXL, Flux, anything ≥ 3 GB in one tensor | ❌ Not tested — likely beyond the per-allocation ceiling |
+| Qwen-Image 2.1 Turbo (GGUF Q5) | ⚠️ UNet loads and computes (297 tensors, 5.01B params, bf16 attention at Qwen's real shape), but no matching VAE class exists in v0.27.0 — see below |
+| SDXL, Flux | ? Not tested — 2D VAEs, so no version barrier, but both need a >3 GB text encoder |
 
 ### Measured on an RX 580 8GB (SD 1.5, ZLUDA)
 
@@ -151,11 +151,32 @@ ComfyUI is pinned to **v0.27.0** for the same reason: v0.37+ needs torch ≥ 2.7
 
 ## What is not supported
 
-- **3D convolutions.** `aten::empty_strided` is not implemented for the
-  PrivateUse1 backend, so `torch.nn.Conv3d` fails outright. That rules out every
-  model whose VAE is 3D — Qwen-Image, CogVideoX and similar — even though their
-  UNet alone loads and computes. It is a ZLUDA kernel gap and cannot be fixed
-  from here; it would need implementing in ZLUDA itself.
+- **Models whose VAE is 3D — Qwen-Image, CogVideoX and similar.** This is not a
+  hardware or memory limit, and not a missing kernel either. It is a *version*
+  problem, and it is the reason SDXL and Flux are expected to work where Qwen
+  does not.
+
+  Measured on the Qwen-Image 2.1 VAE against ComfyUI v0.27.0: its encoder
+  tensors overlap **4 of 84** with the standard `AutoencoderKL` encoder and
+  **1 of 84** with hunyuan's `vae_refiner`. The checkpoint uses standard
+  *naming* (`conv_in`, `down_blocks.N.conv1`, `mid_block`) but with 3D
+  convolutions and RMS norms named `.gamma`. Standard `AutoencoderKL` matches
+  the naming but is 2D with GroupNorm `.weight`; `vae_refiner` matches the maths
+  but names blocks `down[i].block[j]`, `mid.block_1`, `conv_in.conv`. It is a
+  hybrid of the two and v0.27.0 has neither. Current master handles it in the
+  Wan 2.2 branch, keyed on `decoder.head.2.weight`, which this file does not
+  contain.
+
+  So the fix needs a newer ComfyUI — which needs torch >= 2.7 via
+  `comfy-kitchen`, which gfx803 cannot run under ZLUDA.
+
+  A note for anyone debugging this: **3D convolution is not the problem.**
+  `torch.nn.Conv3d` and `empty_strided` both work under ZLUDA. Every
+  convolution, 1d through 3d, fails identically with
+  `CUDNN_STATUS_INTERNAL_ERROR` while cuDNN is enabled, which is easy to
+  misread as a missing kernel. `run_zluda.bat` passes `--disable-cudnn`; if you
+  test anything by hand, set `torch.backends.cudnn.enabled = False` first or
+  you will diagnose the wrong thing.
 - `bfloat16` — the RX 580 has no hardware support, but under **ZLUDA it works**:
   `torch.cuda.is_bf16_supported()` returns True and bf16 matmul, attention,
   layer_norm and gelu all pass. It hard-crashes under DirectML instead, so this
