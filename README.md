@@ -87,7 +87,24 @@ rather than into one contiguous tensor.
 | SD 1.5 (fp16, ~2 GB) | ✅ Works |
 | SD 1.5 inpainting, ControlNet | ✅ Expected to work (not measured) |
 | Qwen-Image 2.1 Turbo (GGUF Q5) | ⚠️ UNet loads and computes (297 tensors, 5.01B params, bf16 attention at Qwen's real shape), but no matching VAE class exists in v0.27.0 — see below |
-| SDXL, Flux | ? Not tested — 2D VAEs, so no version barrier, but both need a >3 GB text encoder |
+| SDXL | ? Untested, but no known blocker — see below |
+| Flux | ? Untested. Same VAE situation as SDXL, but a larger text encoder |
+
+### SDXL is the most likely next step
+
+It is untested here only because the checkpoint is 6.6 GB and this was written
+on a slow connection. Nothing measured rules it out:
+
+- Its VAE is **2D**, so unlike Qwen-Image there is no ComfyUI-version barrier —
+  v0.27.0 has a class for it.
+- It loads as separate pieces (~2.6 GB UNet, ~1.5 GB text encoders, ~0.3 GB
+  VAE), so no single allocation approaches the ~2 GB per-allocation ceiling.
+- It needs 6.6 GB on disk.
+
+To try it:
+
+<https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0> →
+`sd_xl_base_1.0_0.9vae.safetensors`, into `ComfyUI/models/checkpoints/`.
 
 ### Measured on an RX 580 8GB (SD 1.5, ZLUDA)
 
@@ -203,6 +220,11 @@ is gone from GitHub. If setup fails, check in this order:
    3.12 from python.org and re-run with it.
 7. **Stuck downloading torch** — expected on a slow link. Just run `setup.py`
    again; it continues from the bytes it already has.
+8. **`Package 'comfyui_workflow_templates_*' is not installed`** in the ComfyUI
+   log, while the rest of the UI works — a partial download left the package
+   installed but its module missing. `setup.py` now imports every pinned
+   package after install and names anything broken, so this should be caught
+   during setup; if it appears later, re-run `setup.py`.
 
 ## Licence and attribution
 
