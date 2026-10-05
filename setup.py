@@ -51,6 +51,19 @@ PINS = {
     "comfyui-frontend-package": "1.45.20",
     "comfyui-workflow-templates": "0.11.1",
     "comfyui-embedded-docs": "0.5.6",
+    # comfyui-workflow-templates 0.11.1 depends on these exact versions. They
+    # are listed separately because installing the parent alone is not enough:
+    # a leftover newer build satisfies the parent but its own dependencies get
+    # skipped, and ComfyUI then fails at startup with "Package
+    # 'comfyui_workflow_templates_media_*' is not installed" -- once per missing
+    # bundle, while the rest of the UI works and the error looks unrelated.
+    "comfyui-workflow-templates-core": "0.3.266",
+    "comfyui-workflow-templates-json": "0.1.1",
+    "comfyui-workflow-templates-media-api": "0.3.84",
+    "comfyui-workflow-templates-media-video": "0.3.101",
+    "comfyui-workflow-templates-media-image": "0.3.160",
+    "comfyui-workflow-templates-media-other": "0.3.229",
+    "comfyui-workflow-templates-media-assets-01": "0.1.0",
 }
 
 DL = Path("dl")
@@ -478,6 +491,55 @@ def write_launcher(hlib):
     info(f"created {bat.name}")
 
 
+def check_python_packages(vpy):
+    """Confirm every pinned package is importable, not merely installed.
+
+    A leftover newer build satisfies `pip install` while leaving a package
+    whose module directory was never written, and the breakage only surfaces
+    later as an ImportError inside ComfyUI. Importing each one here turns that
+    into an immediate, named failure.
+    """
+    step("Checking Python packages")
+    code = (
+        "import importlib, importlib.metadata as m, sys\n"
+        "bad = []\n"
+        f"want = {PINS!r}\n"
+        "for name, ver in want.items():\n"
+        "    mod = name.replace('-', '_')\n"
+        "    try:\n"
+        "        have = m.version(name)\n"
+        "    except Exception:\n"
+        "        have = None\n"
+        "    try:\n"
+        "        importlib.import_module(mod)\n"
+        "        ok = True\n"
+        "    except Exception as e:\n"
+        "        ok = False\n"
+        "        print(f'   FAIL {name}: {type(e).__name__}')\n"
+        "    if not ok:\n"
+        "        bad.append(name)\n"
+        "    elif have != ver:\n"
+        "        print(f'   WARN {name}: {have} installed, {ver} pinned')\n"
+        "print('BROKEN=' + ','.join(bad))\n"
+    )
+    r = subprocess.run([str(vpy), "-c", code], capture_output=True, text=True)
+    for line in (r.stdout or "").splitlines():
+        if line.strip():
+            print("   ", line.strip())
+    out = (r.stdout or "")
+    broken = ""
+    for line in out.splitlines():
+        if line.startswith("BROKEN="):
+            broken = line.split("=", 1)[1].strip()
+    if broken:
+        raise SystemExit(
+            f"These packages are installed but cannot be imported: {broken}\n"
+            "  This usually means a partial download. Re-run setup.py; it will\n"
+            "  reinstall them. If it persists, clear the pip cache first:\n"
+            "    python -m pip cache purge")
+    info("all pinned packages import cleanly")
+
+
 def verify(vpy, hlib):
     step("Verifying the GPU is actually visible")
     env = dict(os.environ)
@@ -517,6 +579,7 @@ def main():
     hlib = setup_hip(admin)
     setup_rocblas(hlib)
     vpy = setup_venv()
+    check_python_packages(vpy)
     setup_torch_dlls(vpy)
     setup_shim(vpy)
     setup_comfyui()
