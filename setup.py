@@ -1,4 +1,4 @@
-"""Set up ComfyUI to run on an AMD Radeon RX 580 (gfx803) via ZLUDA.
+"""Set up ComfyUI to run on older AMD GPUs (Polaris, Vega) via ZLUDA.
 
 This automates what was done by hand on one machine, and refuses to guess when
 it meets something it cannot verify. It is deliberately conservative: every step
@@ -571,7 +571,7 @@ def main():
     ap.add_argument("--yes", action="store_true")
     a = ap.parse_args()
     Path(DL).mkdir(exist_ok=True)
-    print("ComfyUI on Radeon RX 580 (gfx803) via ZLUDA")
+    print("ComfyUI on older AMD GPUs (Polaris gfx803, Vega gfx900) via ZLUDA")
     print("This is unofficial. See README.md for what may go wrong.")
 
     admin = check_prereqs()

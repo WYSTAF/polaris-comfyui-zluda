@@ -1,13 +1,43 @@
-# ComfyUI on an AMD Radeon RX 580 (gfx803) — Windows
+# ComfyUI on older AMD GPUs via ZLUDA — Windows
 
-This sets up [ComfyUI](https://github.com/Comfy-Org/ComfyUI) so it runs on Polaris
-cards (RX 570 / 580 / 590, and the RX 480/470 family) on Windows. It was built by
-working through the setup on a real RX 580 8GB, where the usual install path
-produces a hardcoded "1 GB VRAM" message and never touches the GPU.
+This sets up [ComfyUI](https://github.com/Comfy-Org/ComfyUI) so it actually uses
+an AMD GPU that modern ROCm no longer supports. It was built by working through
+the setup on a real RX 580 8GB, where the usual install path produces a
+hardcoded "1 GB VRAM" message and never touches the GPU at all.
+
+The mechanism is **ZLUDA**, which translates CUDA calls to ROCm/HIP so PyTorch
+and ComfyUI can run on cards AMD has dropped. That is also why this works at
+all: Microsoft's own `torch-directml` — the official path — was **deleted from
+GitHub**, with its last release in September 2024.
 
 **Please read [Before you start](#before-you-start) first.** This is unofficial
 software on top of a dependency that no longer exists upstream. It works, but
 nobody is obliged to keep it working.
+
+## Which GPUs
+
+Support is bounded by the patched rocBLAS this installs, which ships kernels
+for **gfx803 and gfx900 only**. That was verified by listing the shipped kernel
+files, not inferred from marketing.
+
+| Architecture | Cards | Status |
+|---|---|---|
+| **gfx803** — Polaris | RX 460, 470, 480, 560, 570, 580, 590 | ✅ **Tested** on RX 580 8GB |
+| **gfx900** — Vega | RX Vega 56, RX Vega 64 | ⚠️ Kernels present, not tested here |
+| Anything newer | RX 5000/6000 (Navi), RDNA 2+ | ❌ No kernels in this patch |
+
+Two things worth being precise about:
+
+- **Upstream ZLUDA excludes these cards.** `vosen/ZLUDA` states older consumer
+  GPUs (Polaris, Vega) "are not supported"; only the `lshqqytiger` fork plus the
+  patched rocBLAS handles them. The setup script fetches the fork.
+- **Vega is plausible, not proven.** The kernels are there, but every number in
+  this README was measured on an RX 580. If you have a Vega, please open an
+  issue with what you find — it is genuinely useful information.
+
+Cards with 4 GB (RX 460/560, some 470s) are tighter than the 8 GB parts tested
+here; the per-allocation ceiling below is the same, but there is less room
+around it.
 
 ## What you get
 
@@ -56,7 +86,7 @@ Four things that will otherwise cost you an evening:
 
 ```
 git clone <this-repo>
-cd rx580-comfyui
+cd polaris-comfyui-zluda
 python setup.py
 ```
 
