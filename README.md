@@ -117,24 +117,35 @@ rather than into one contiguous tensor.
 | SD 1.5 (fp16, ~2 GB) | ✅ Works |
 | SD 1.5 inpainting, ControlNet | ✅ Expected to work (not measured) |
 | Qwen-Image 2.1 Turbo (GGUF Q5) | ⚠️ UNet loads and computes (297 tensors, 5.01B params, bf16 attention at Qwen's real shape), but no matching VAE class exists in v0.27.0 — see below |
-| SDXL | ? Untested, but no known blocker — see below |
-| Flux | ? Untested. Same VAE situation as SDXL, but a larger text encoder |
+| SDXL | ❌ Downloads and verifies, but exceeds host RAM to load — see below |
+| Flux | ? Untested. Same 2D-VAE situation as SDXL, but larger still |
 
-### SDXL is the most likely next step
+### SDXL does not fit in host memory
 
-It is untested here only because the checkpoint is 6.6 GB and this was written
-on a slow connection. Nothing measured rules it out:
+Downloaded and verified (`sd_xl_base_1.0_0.9vae.safetensors`, 6.46 GB, 2515
+tensors), then measured. It does not run on a 16 GB machine, and **VRAM is not
+the reason**:
 
-- Its VAE is **2D**, so unlike Qwen-Image there is no ComfyUI-version barrier —
-  v0.27.0 has a class for it.
-- It loads as separate pieces (~2.6 GB UNet, ~1.5 GB text encoders, ~0.3 GB
-  VAE), so no single allocation approaches the ~2 GB per-allocation ceiling.
-- It needs 6.6 GB on disk.
+| Operation | Result |
+|---|---|
+| Sequential read of all 6.46 GB | ✅ works |
+| Materialise all 2515 tensors from one buffer | ✅ works, 2.9 s |
+| `bytearray` copy of the file | ❌ `MemoryError` — needs 2× |
+| `safetensors.torch.load_file` | ❌ segfault |
+| `safe_open` (mmap) | ❌ access violation |
 
-To try it:
+The file and the card are both fine. Its parts are all comfortably under the
+per-allocation ceiling — UNet 4.78 GB total but its largest single tensor is
+only **56 MB**, text encoders 1.29 GB and 0.23 GB, VAE 0.16 GB. 8 GB of VRAM
+would be plenty.
 
-<https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0> →
-`sd_xl_base_1.0_0.9vae.safetensors`, into `ComfyUI/models/checkpoints/`.
+The blocker is that **both** loader paths fail: mmap faults, and the copy path
+needs ~13 GB resident at once, while Python, torch and ZLUDA already hold
+~2 GB before the load starts.
+
+If you have a machine with more RAM, or can free everything and enlarge the
+pagefile, it should work with the launcher as-is. Do not expect changing
+ComfyUI flags to help — the load never completes.
 
 ### Measured on an RX 580 8GB (SD 1.5, ZLUDA)
 
@@ -200,8 +211,8 @@ ComfyUI is pinned to **v0.27.0** for the same reason: v0.37+ needs torch ≥ 2.7
 
 - **Models whose VAE is 3D — Qwen-Image, CogVideoX and similar.** This is not a
   hardware or memory limit, and not a missing kernel either. It is a *version*
-  problem, and it is the reason SDXL and Flux are expected to work where Qwen
-  does not.
+  problem. SDXL and Flux use 2D VAEs and so are not blocked this way, but SDXL
+  hits a separate wall on a 16 GB host — see above.
 
   Measured on the Qwen-Image 2.1 VAE against ComfyUI v0.27.0: its encoder
   tensors overlap **4 of 84** with the standard `AutoencoderKL` encoder and
