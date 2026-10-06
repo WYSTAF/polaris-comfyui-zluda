@@ -45,10 +45,10 @@ around it.
 - Correct VRAM detection (ComfyUI otherwise hardcodes 1 GiB for DirectML)
 - `run_zluda.bat` — one double-click to launch
 
-Real numbers from an RX 580 8GB, SD 1.5, 512×512, 20 steps: **about 100 seconds**
-once warm. The first run takes 5–10 minutes longer while ZLUDA compiles its
-kernels; those are cached afterwards, so do not delete
-`%LOCALAPPDATA%\ZLUDA\ComputeCache`.
+Real numbers from an RX 580 8GB, SD 1.5, 512×512, 20 steps: **45–50 seconds**
+once warm, and clean images up to 768×768 (115 s). The first run takes 5–10
+minutes longer while ZLUDA compiles its kernels; those are cached afterwards,
+so do not delete `%LOCALAPPDATA%\ZLUDA\ComputeCache`.
 
 ## Before you start
 
@@ -58,7 +58,7 @@ You need:
 |---|---|
 | OS | Windows 10 22H2 (build 19045) or Windows 11 |
 | Python | **3.12, exactly** — the prebuilt wheels do not exist for 3.13. A Python without `venv` (such as ComfyUI's bundled `python_embeded`) is detected and worked around, but a normal install from python.org is easier |
-| Disk | 12 GB free |
+| Disk | 12 GB free for the setup, plus room for models — SD 1.5 fp16 is 2 GB, SDXL base is 6.5 GB |
 | RAM | 16 GB recommended; 8 GB will struggle |
 | Admin rights | Needed once, for the HIP SDK install |
 | Connection | ~4 GB downloads in total. On a slow or metered link this takes a while |
