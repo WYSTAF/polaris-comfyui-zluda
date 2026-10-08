@@ -58,8 +58,8 @@ You need:
 |---|---|
 | OS | Windows 10 22H2 (build 19045) or Windows 11 |
 | Python | **3.12, exactly** — the prebuilt wheels do not exist for 3.13. A Python without `venv` (such as ComfyUI's bundled `python_embeded`) is detected and worked around, but a normal install from python.org is easier |
-| Disk | 12 GB free for the setup, plus room for models — SD 1.5 fp16 is 2 GB, SDXL base is 6.5 GB |
-| RAM | 16 GB recommended; 8 GB will struggle. **Close the browser before running SDXL** — it needs roughly 16 GB of commit charge free at load time |
+| Disk | 12 GB free for the setup, plus room for models — SD 1.5 fp16 is 2 GB |
+| RAM | 16 GB recommended; 8 GB will struggle. Close the browser before loading any model — a busy machine kills the load part-way with no error message |
 | Admin rights | Needed once, for the HIP SDK install |
 | Connection | ~4 GB downloads in total. On a slow or metered link this takes a while |
 
@@ -117,46 +117,40 @@ rather than into one contiguous tensor.
 | SD 1.5 (fp16, ~2 GB) | ✅ Works |
 | SD 1.5 inpainting, ControlNet | ✅ Expected to work (not measured) |
 | Qwen-Image 2.1 Turbo (GGUF Q5) | ⚠️ UNet loads and computes (297 tensors, 5.01B params, bf16 attention at Qwen's real shape), but no matching VAE class exists in v0.27.0 — see below |
-| SDXL base 1.0 | ✅ **Works** — 64 s at 512×512. Needs ~16 GB commit free to load |
+| SDXL base 1.0 | ✅ Works — 64 s at 512×512 (benchmarked, then removed; see below) |
 | Flux | ? Untested. Same 2D-VAE situation as SDXL, but larger still |
 
-### SDXL works — close everything else first
+### SDXL also runs — benchmarked, then removed
 
-Tested on an RX 580 8GB. `sd_xl_base_1.0_0.9vae.safetensors`, 6.46 GB, 2515
-tensors, downloaded from ModelScope.
+**It works**, and this is kept as a record of the measurement rather than a
+recommendation. `sd_xl_base_1.0_0.9vae.safetensors`, 6.46 GB, downloaded from
+ModelScope, generated in 63.8 s at 512×512 / 25 steps / `dpmpp_2m` + `karras`,
+with 4897 MB of the model resident on the GPU.
 
 ![SDXL on an RX 580 via ZLUDA](docs/images/sdxl_512_25steps.png)
 
-*512×512, 25 steps, dpmpp_2m + karras, cfg 7 — 63.8 s, 4897 MB of the model
-resident on the GPU.*
+*512×512, 25 steps, dpmpp_2m + karras, cfg 7 — 63.8 s, 4897 MB on the GPU.*
 
-| | |
-|---|---|
-| Resolution | 512×512 |
-| Sampler | `dpmpp_2m` + `karras`, cfg 7 |
-| Steps | 25 |
-| Time | **63.8 s** |
-| Loaded on GPU | 4897 MB |
+Two findings from that run are worth keeping even though the checkpoint is gone:
 
-**VRAM was never the obstacle**, which the numbers make plain: 4897 MB is far
-above the ~2 GB per-single-allocation limit elsewhere in this README, but that
-limit applies to one tensor at a time, and SDXL's largest single tensor is only
-56 MB.
+- **VRAM was never the obstacle.** 4897 MB sits far above the ~2 GB
+  per-single-allocation limit elsewhere in this README, but that limit applies
+  to one tensor at a time, and SDXL's largest single tensor is only 56 MB.
+- **The real requirement is host memory at load time** — roughly 16 GB of
+  commit charge free. Below that the load dies part-way with an access
+  violation and no Python traceback, which reads like a driver fault and is not.
 
-**The one real requirement is host memory at load time.** It needs roughly
-**16 GB of commit charge free** — about 10.6 GB of free RAM with nothing else
-running. On a busy machine the load dies part-way with an access violation and
-no Python traceback, which reads like a driver fault and is not. Close the
-browser first; that is usually enough.
-
-If you under-sample it looks broken. At 4 steps the output is heavily banded,
-which looks like a hardware problem but is only step count:
+At 4 steps the output is heavily banded, which also looks like a hardware fault
+but is only step count:
 
 ![SDXL at 4 steps, undersampled](docs/images/sdxl_512_4steps_undersampled.png)
 
 *Same prompt at 4 steps. Use 25 or more.*
 
-Checkpoint:
+**It is not installed here any more.** The 6.5 GB checkpoint was benchmarked and
+removed — on an 8 GB card SD 1.5 is the more practical default, being faster and
+a fraction of the size. The download link, if you want to repeat the test:
+
 <https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0> →
 `sd_xl_base_1.0_0.9vae.safetensors`, into `ComfyUI/models/checkpoints/`.
 
@@ -224,8 +218,8 @@ ComfyUI is pinned to **v0.27.0** for the same reason: v0.37+ needs torch ≥ 2.7
 
 - **Models whose VAE is 3D — Qwen-Image, CogVideoX and similar.** This is not a
   hardware or memory limit, and not a missing kernel either. It is a *version*
-  problem, and it is why SDXL works here while Qwen-Image does not: SDXL's VAE is
-  2D and v0.27.0 has a class for it.
+  problem, and it is why a 2D-VAE model like SDXL or SD 1.5 works here while
+  Qwen-Image does not: v0.27.0 has a class for the 2D case.
 
   Measured on the Qwen-Image 2.1 VAE against ComfyUI v0.27.0: its encoder
   tensors overlap **4 of 84** with the standard `AutoencoderKL` encoder and
@@ -281,8 +275,9 @@ is gone from GitHub. If setup fails, check in this order:
    during setup; if it appears later, re-run `setup.py`.
 9. **ComfyUI dies part-way through loading a model, with no error** — almost
    always host memory, not the GPU. There is no Python traceback, just an access
-   violation and a dead process. SDXL on a 16 GB box needs ~16 GB of commit
-   charge free before it starts; close the browser and anything else, and retry.
+   violation and a dead process. Larger models need more commit charge free at
+   load time; close the browser and anything else, and retry. Moving the display
+   to the iGPU also frees VRAM, which helps but is not the whole story.
 
 ## Licence and attribution
 
