@@ -1,5 +1,9 @@
 # ComfyUI on older AMD GPUs via ZLUDA — Windows
 
+<p align="center">
+  <img src="docs/images/Comfyui on AMD with Zluda (header github).jpg" width="900" alt="Comfyui on AMD with Zluda (header github)" />
+</p>
+
 This sets up [ComfyUI](https://github.com/Comfy-Org/ComfyUI) so it actually uses
 an AMD GPU that modern ROCm no longer supports. It was built by working through
 the setup on a real RX 580 8GB, where the usual install path produces a
